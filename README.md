@@ -4,6 +4,9 @@
   <img src="assets/framework.png" width="800">
 </p>
 
+## Project Description
+The development of a domain-adaptive semi-supervised learning framework for echocardiography analysis that integrates labeled and unlabeled data within a unified semantic representation. By jointly optimizing contrastive representation learning and task-specific supervision, the proposed approach aligns unlabeled samples with labeled semantic structures, mitigates domain shift, and reduces reliance on expert annotations, using temperature scaling and evaluating extensively on several datasets and benchmarked against several vision-language models (VLMs), demonstrating promising results.
+
 cl_losses_temp_comparison.py:
 
 This file contains the code used to obtain the results for the ablation studies. In this file, we compare three different contrastive losses: supervised contrastive loss, N-pair loss, and the proposed symmetric contrastive loss. We also compare two temperature strategies: a fixed temperature and a learnable temperature.
