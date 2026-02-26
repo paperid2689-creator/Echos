@@ -293,6 +293,49 @@ class DataAugmentationDINO(object):
         
         return crops
 
+'''
+class SupervisedTemporalContrastiveLoss(nn.Module):
+    """
+    Reference: Khosla et al. "Supervised Contrastive Learning" (NeurIPS 2020)
+    """
+    def __init__(self, temperature=0.07):
+        super().__init__()
+        self.temperature = temperature
+
+    def forward(self, features_t, features_t_plus_d, labels):
+
+        device = features_t.device
+
+        features = torch.cat([features_t, features_t_plus_d], dim=0)
+        features = F.normalize(features, dim=-1)
+
+        labels = torch.cat([labels, labels], dim=0)  # (2B,)
+
+        batch_size = features.shape[0]  # 2B
+        sim_matrix = torch.mm(features, features.t()) / self.temperature  # (2B, 2B)
+
+        labels_row = labels.unsqueeze(1)           # (2B, 1)
+        labels_col = labels.unsqueeze(0)           # (1, 2B)
+        positive_mask = (labels_row == labels_col).float().to(device)  # (2B, 2B)
+        self_mask = torch.eye(batch_size, dtype=torch.float, device=device)
+        positive_mask = positive_mask - self_mask  # remove diagonal
+
+        sim_max, _ = sim_matrix.max(dim=1, keepdim=True)
+        sim_matrix = sim_matrix - sim_max.detach()
+
+        exp_sim = torch.exp(sim_matrix)
+
+        denom = (exp_sim * (1 - self_mask)).sum(dim=1, keepdim=True)  # (2B, 1)
+
+        log_prob = sim_matrix - torch.log(denom + 1e-8)  # (2B, 2B)
+        num_positives = positive_mask.sum(dim=1)  # (2B,)
+
+        valid = num_positives > 0
+        loss = -(positive_mask * log_prob).sum(dim=1)  # (2B,)
+        loss = loss[valid] / num_positives[valid]
+
+        return loss.mean()
+'''
 
 class TemporalContrastiveLoss(nn.Module):
 
