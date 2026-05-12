@@ -21,11 +21,21 @@ from sklearn.manifold import TSNE
 from sklearn.utils import resample
 
 import matplotlib
-matplotlib.use('Agg')  # non-interactive backend for server use
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 
-from torchvision.models import vit_b_32
+# FIX 1: Use weights= API (pretrained= is removed in torchvision ≥ 0.16)
+from torchvision.models import vit_b_32, ViT_B_32_Weights
+
+# ============================================================================
+# H100 GLOBAL FLAGS  ← new
+# TF32 is enabled by default on Ampere/Hopper but be explicit.
+# These alone give ~10–15 % throughput gain on matmul-heavy models.
+# ============================================================================
+torch.backends.cuda.matmul.allow_tf32  = True
+torch.backends.cudnn.allow_tf32        = True
+torch.backends.cudnn.benchmark         = True   # picks fastest conv algo per shape
 
 # ============================================================================
 # CONFIGURATION
@@ -37,21 +47,27 @@ CONFIG = {
         'cactus':  '/root/Datasets/Cactus/Train/',
         'human':   '/root/Datasets/Human/Train',
     },
-    'model_path':   '/root/vit/vit_b_32-d86f8d99.pth',
-    'output_dir':   '/root/final_results/final_results',
-    'epochs':       25,
-    'batch_size':   128,
+    'model_path':    '/root/vit/vit_b_32-d86f8d99.pth',
+    'output_dir':    '/root/final_results/final_results',
+    'epochs':        25,
+    # FIX / OPT 2: H100 has 80 GB — batch 512 fills the GPU much better
+    # than 128, cutting overhead per-sample by ~4×. Adjust down if OOM.
+    'batch_size':    512,
     'learning_rate': 1e-4,
-    'num_folds':    3,
-    'seed':         42,
-    'val_interval': 10,
-    'tsne_enabled': True,   # set False to skip t-SNE (saves time)
-    'bootstrap_n':  1000,   # number of bootstrap iterations for CI
+    'num_folds':     3,
+    'seed':          42,
+    'val_interval':  10,
+    'tsne_enabled':  True,
+    'bootstrap_n':   1000,
+    # OPT: number of DataLoader workers per GPU process.
+    # H100 nodes often have 96–128 CPUs; 8 per GPU × 7 GPUs = 56 threads.
+    # Safe default. Raise to 12 if your node has ≥ 96 cores.
+    'num_workers':   8,
 }
 
-FIXED_TEMPS    = [0.02, 0.05, 0.07, 0.10, 0.20, 0.50, 1.00]
+FIXED_TEMPS     = [0.02, 0.05, 0.07, 0.10, 0.20, 0.50, 1.00]
 LEARNABLE_TEMPS = [0.02, 0.05, 0.07, 0.10, 0.20, 0.50, 1.00]
-LOSS_TYPES     = ['supervised_contrastive', 'npair', 'symmetric_contrastive']
+LOSS_TYPES      = ['supervised_contrastive', 'npair', 'symmetric_contrastive']
 
 DATASET_COMBINATIONS = {
     'vimedix_only':         ['vimedix'],
@@ -188,7 +204,7 @@ class CardiacUltrasoundDataset(Dataset):
     def _load_image_cached(self, idx):
         if idx not in self.image_cache:
             try:
-                image   = Image.open(self.image_paths[idx]).convert("L")
+                image     = Image.open(self.image_paths[idx]).convert("L")
                 transform = self.cached_transforms[self.dataset_names[idx]]
                 self.image_cache[idx] = transform(image)
             except Exception:
@@ -200,9 +216,9 @@ class CardiacUltrasoundDataset(Dataset):
             image = self._load_image_cached(idx)
         else:
             try:
-                image   = Image.open(self.image_paths[idx]).convert("L")
+                image     = Image.open(self.image_paths[idx]).convert("L")
                 transform = self.cached_transforms[self.dataset_names[idx]]
-                image   = transform(image)
+                image     = transform(image)
             except Exception:
                 image = torch.zeros(1, 224, 224)
         return image, self.labels[idx]
@@ -397,14 +413,15 @@ def train_epoch(model, criterion, optimizer, train_loader, device,
 
     total_loss = 0.0
     for images, labels in train_loader:
-        images = images.to(device)
-        labels = labels.to(device)
+        images = images.to(device, non_blocking=True)   # non_blocking with pin_memory
+        labels = labels.to(device, non_blocking=True)
 
-        with torch.cuda.amp.autocast():
+        # FIX 2: torch.cuda.amp.autocast is deprecated → use torch.amp.autocast
+        with torch.amp.autocast('cuda'):
             embeddings = model(images)
             loss       = criterion(embeddings, labels)
 
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)   # set_to_none=True saves a memset
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.projection.parameters(), 1.0)
@@ -419,31 +436,19 @@ def train_epoch(model, criterion, optimizer, train_loader, device,
 
 
 # ============================================================================
-# EVALUATION  ← UPDATED
+# EVALUATION
 # ============================================================================
 
 def evaluate_model(model, val_loader, device, num_classes, return_embeddings=False):
-    """
-    Runs KNN evaluation on the validation set and returns a comprehensive
-    metrics dictionary including accuracy, macro-F1, AUROC, per-class
-    sensitivity/specificity, and confusion matrix.
-
-    Parameters
-    ----------
-    model            : trained ViTEncoder
-    val_loader       : DataLoader for validation split
-    device           : torch device
-    num_classes      : total number of classes in the dataset
-    return_embeddings: if True, also return raw embeddings and labels
-                       (used for t-SNE on the final epoch)
-    """
     model.eval()
     all_embeddings, all_labels = [], []
 
     with torch.no_grad():
         for images, labels in val_loader:
-            images = images.to(device)
-            all_embeddings.append(model(images).cpu())
+            images = images.to(device, non_blocking=True)
+            # FIX 2 (same): use torch.amp.autocast for consistency
+            with torch.amp.autocast('cuda'):
+                all_embeddings.append(model(images).cpu())
             all_labels.append(labels.cpu())
 
     embeddings = torch.cat(all_embeddings, dim=0).numpy()
@@ -455,10 +460,8 @@ def evaluate_model(model, val_loader, device, num_classes, return_embeddings=Fal
 
     true  = labels[split:]
     preds = knn.predict(embeddings[split:])
-    probs = knn.predict_proba(embeddings[split:])   # shape: (N, num_classes)
+    probs = knn.predict_proba(embeddings[split:])
 
-    # --- confusion matrix & per-class sensitivity / specificity ----------
-    present_classes = np.unique(true)
     cm = confusion_matrix(true, preds, labels=list(range(num_classes)))
 
     per_class_sensitivity, per_class_specificity = [], []
@@ -470,30 +473,23 @@ def evaluate_model(model, val_loader, device, num_classes, return_embeddings=Fal
         per_class_sensitivity.append(float(tp / (tp + fn + 1e-10)))
         per_class_specificity.append(float(tn / (tn + fp + 1e-10)))
 
-    # --- AUROC (guard against missing classes in small val splits) --------
     try:
-        # knn.predict_proba columns follow knn.classes_ order; we need to
-        # pad to full num_classes if some classes are absent from the val set
         full_probs = np.zeros((len(true), num_classes))
         for col_idx, cls in enumerate(knn.classes_):
             full_probs[:, cls] = probs[:, col_idx]
-
         auroc = roc_auc_score(
             true, full_probs,
-            multi_class='ovr',
-            average='macro',
+            multi_class='ovr', average='macro',
             labels=list(range(num_classes))
         )
     except ValueError as e:
         print(f"    [AUROC warning] {e}")
         auroc = float('nan')
 
-    # --- per-class F1 (zero_division=0 avoids warnings) ------------------
     per_class_f1 = f1_score(
         true, preds,
         labels=list(range(num_classes)),
-        average=None,
-        zero_division=0
+        average=None, zero_division=0
     ).tolist()
 
     metrics = {
@@ -506,7 +502,6 @@ def evaluate_model(model, val_loader, device, num_classes, return_embeddings=Fal
         'per_class_sensitivity': per_class_sensitivity,
         'per_class_specificity': per_class_specificity,
         'confusion_matrix':      cm.tolist(),
-        # keep true/preds for bootstrap CI in ResultsManager
         '_true':                 true,
         '_preds':                preds,
     }
@@ -519,25 +514,10 @@ def evaluate_model(model, val_loader, device, num_classes, return_embeddings=Fal
 
 
 # ============================================================================
-# BOOTSTRAP CONFIDENCE INTERVAL  ← NEW
+# BOOTSTRAP CONFIDENCE INTERVAL
 # ============================================================================
 
 def bootstrap_ci(true, preds, metric_fn, n_bootstrap=1000, ci=95, seed=42):
-    """
-    Compute mean and (ci)% confidence interval for a metric via bootstrap.
-
-    Parameters
-    ----------
-    true, preds  : array-like ground truth and predictions
-    metric_fn    : callable(true, preds) -> float
-    n_bootstrap  : number of resampling iterations
-    ci           : confidence level (e.g. 95 → 2.5th–97.5th percentile)
-    seed         : random seed for reproducibility
-
-    Returns
-    -------
-    (mean, lower, upper) as floats
-    """
     rng    = np.random.RandomState(seed)
     scores = []
     true   = np.asarray(true)
@@ -562,32 +542,18 @@ def bootstrap_ci(true, preds, metric_fn, n_bootstrap=1000, ci=95, seed=42):
 
 
 # ============================================================================
-# t-SNE VISUALIZATION  ← NEW
+# t-SNE VISUALIZATION
 # ============================================================================
 
 def save_tsne(embeddings, labels, dataset_source_per_sample,
               output_path, title="", class_names=None):
-    """
-    Produce a two-panel t-SNE figure:
-      Left  — coloured by class label
-      Right — coloured by dataset source (domain)
-
-    Parameters
-    ----------
-    embeddings               : np.ndarray (N, D)
-    labels                   : np.ndarray (N,) int class indices
-    dataset_source_per_sample: list[str] of length N, e.g. ['vimedix', ...]
-    output_path              : str or Path where the PNG is saved
-    title                    : figure suptitle prefix
-    class_names              : optional dict {int -> str} for legend labels
-    """
     print("  Computing t-SNE (this may take a moment)...")
-    max_samples = 5000   # cap for speed; remove if you have time to spare
+    max_samples = 5000
     if len(embeddings) > max_samples:
         rng = np.random.RandomState(42)
         idx = rng.choice(len(embeddings), max_samples, replace=False)
-        embeddings              = embeddings[idx]
-        labels                  = labels[idx]
+        embeddings                = embeddings[idx]
+        labels                    = labels[idx]
         dataset_source_per_sample = [dataset_source_per_sample[i] for i in idx]
 
     proj = TSNE(
@@ -598,7 +564,6 @@ def save_tsne(embeddings, labels, dataset_source_per_sample,
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
     fig.suptitle(title, fontsize=11)
 
-    # --- Panel 1: by class label -----------------------------------------
     unique_labels = np.unique(labels)
     colors_cls    = cm.tab20(np.linspace(0, 1, max(len(unique_labels), 1)))
     for i, lbl in enumerate(unique_labels):
@@ -612,7 +577,6 @@ def save_tsne(embeddings, labels, dataset_source_per_sample,
                    framealpha=0.6, ncol=max(1, len(unique_labels) // 8))
     axes[0].axis('off')
 
-    # --- Panel 2: by domain source ---------------------------------------
     unique_domains = sorted(set(dataset_source_per_sample))
     colors_dom     = cm.Set1(np.linspace(0, 1, max(len(unique_domains), 1)))
     src_arr        = np.array(dataset_source_per_sample)
@@ -632,7 +596,7 @@ def save_tsne(embeddings, labels, dataset_source_per_sample,
 
 
 # ============================================================================
-# RESULTS MANAGER  ← UPDATED
+# RESULTS MANAGER
 # ============================================================================
 
 class ResultsManager:
@@ -652,7 +616,6 @@ class ResultsManager:
     def _init_csv(self):
         self.csv_file_handle = open(self.csv_file, 'w', newline='')
         self.csv_writer      = csv.writer(self.csv_file_handle)
-        # ← expanded columns
         self.csv_writer.writerow([
             'Timestamp', 'Dataset', 'Loss Type', 'Temperature Type', 'Temperature Value',
             'Mean Accuracy', 'Std Accuracy', 'CI95 Lower', 'CI95 Upper',
@@ -664,17 +627,10 @@ class ResultsManager:
         ])
         self.csv_file_handle.flush()
 
-    # ------------------------------------------------------------------
     def save_experiment(self, dataset_name, loss_type, temp_type, temp_value,
-                        fold_results, model_path=None,
-                        n_bootstrap=1000):
-        """
-        Aggregate metrics across folds, compute bootstrap CI on accuracy,
-        write to CSV and JSON, and return the result dict.
-        """
+                        fold_results, model_path=None, n_bootstrap=1000):
         key = f"{dataset_name}_{loss_type}_{temp_type}_{temp_value}"
 
-        # ---- per-fold scalars ----------------------------------------
         accs          = [r['val_metrics']['accuracy']         for r in fold_results]
         f1s           = [r['val_metrics']['macro_f1']         for r in fold_results]
         aurocs        = [r['val_metrics']['auroc']            for r in fold_results]
@@ -686,7 +642,6 @@ class ResultsManager:
         min_losses     = [min(lh) for lh in losses_history if lh]
         final_losses   = [lh[-1]  for lh in losses_history if lh]
 
-        # ---- bootstrap CI on accuracy (last fold as representative) --
         last_true  = fold_results[-1].get('_true',  np.array([]))
         last_preds = fold_results[-1].get('_preds', np.array([]))
         if len(last_true) > 0:
@@ -698,43 +653,35 @@ class ResultsManager:
         else:
             ci_low, ci_high = float('nan'), float('nan')
 
-        # ---- confusion matrix (average across folds element-wise) ----
-        cms = [np.array(r['val_metrics']['confusion_matrix']) for r in fold_results]
+        cms     = [np.array(r['val_metrics']['confusion_matrix']) for r in fold_results]
         mean_cm = np.mean(cms, axis=0).round(1).tolist() if cms else []
 
         result = {
-            'timestamp':           datetime.now().isoformat(),
-            'dataset':             dataset_name,
-            'loss_type':           loss_type,
-            'temp_type':           temp_type,
-            'temp_value':          temp_value,
-            # accuracy
-            'mean_val_acc':        float(np.mean(accs)),
-            'std_val_acc':         float(np.std(accs)),
-            'ci95_lower':          ci_low,
-            'ci95_upper':          ci_high,
-            # F1
-            'mean_macro_f1':       float(np.nanmean(f1s)),
-            'std_macro_f1':        float(np.nanstd(f1s)),
-            # AUROC
-            'mean_auroc':          float(np.nanmean(aurocs)),
-            'std_auroc':           float(np.nanstd(aurocs)),
-            # sensitivity / specificity
-            'mean_sensitivity':    float(np.mean(sensitivities)),
-            'std_sensitivity':     float(np.std(sensitivities)),
-            'mean_specificity':    float(np.mean(specificities)),
-            'std_specificity':     float(np.std(specificities)),
-            # loss
-            'min_loss':            float(np.min(min_losses))   if min_losses  else 0.0,
-            'final_loss':          float(np.mean(final_losses)) if final_losses else 0.0,
-            'mean_epochs_trained': float(np.mean(epochs_trained)),
-            # confusion matrix
+            'timestamp':             datetime.now().isoformat(),
+            'dataset':               dataset_name,
+            'loss_type':             loss_type,
+            'temp_type':             temp_type,
+            'temp_value':            temp_value,
+            'mean_val_acc':          float(np.mean(accs)),
+            'std_val_acc':           float(np.std(accs)),
+            'ci95_lower':            ci_low,
+            'ci95_upper':            ci_high,
+            'mean_macro_f1':         float(np.nanmean(f1s)),
+            'std_macro_f1':          float(np.nanstd(f1s)),
+            'mean_auroc':            float(np.nanmean(aurocs)),
+            'std_auroc':             float(np.nanstd(aurocs)),
+            'mean_sensitivity':      float(np.mean(sensitivities)),
+            'std_sensitivity':       float(np.std(sensitivities)),
+            'mean_specificity':      float(np.mean(specificities)),
+            'std_specificity':       float(np.std(specificities)),
+            'min_loss':              float(np.min(min_losses))    if min_losses  else 0.0,
+            'final_loss':            float(np.mean(final_losses)) if final_losses else 0.0,
+            'mean_epochs_trained':   float(np.mean(epochs_trained)),
             'mean_confusion_matrix': mean_cm,
-            'model_path':          model_path,
+            'model_path':            model_path,
         }
 
         self.all_results[key] = result
-
         self.csv_writer.writerow([
             result['timestamp'], dataset_name, loss_type, temp_type, temp_value,
             result['mean_val_acc'],     result['std_val_acc'],
@@ -750,10 +697,8 @@ class ResultsManager:
         self._save_json()
         return result
 
-    # ------------------------------------------------------------------
     def _save_json(self):
         with open(self.results_file, 'w') as f:
-            # strip internal numpy arrays before serialising
             serialisable = {}
             for key, val in self.all_results.items():
                 serialisable[key] = {
@@ -772,7 +717,7 @@ class ResultsManager:
 
 
 # ============================================================================
-# EXPERIMENT RUNNER  ← UPDATED
+# EXPERIMENT RUNNER
 # ============================================================================
 
 def run_experiment(dataset_paths, dataset_names, loss_type, temp_type, temp_value,
@@ -785,7 +730,7 @@ def run_experiment(dataset_paths, dataset_names, loss_type, temp_type, temp_valu
     dataset         = CardiacUltrasoundDataset(
         dataset_paths, dataset_names, transforms_dict, preload=False
     )
-    num_classes = dataset.class_counter   # ← needed for evaluate_model
+    num_classes = dataset.class_counter
 
     train_size = int(0.8 * len(dataset))
     val_size   = len(dataset) - train_size
@@ -794,19 +739,41 @@ def run_experiment(dataset_paths, dataset_names, loss_type, temp_type, temp_valu
         generator=torch.Generator().manual_seed(config['seed'] + fold)
     )
 
-    train_loader = DataLoader(train_dataset, batch_size=config['batch_size'],
-                              shuffle=True, num_workers=8, pin_memory=True)
-    val_loader   = DataLoader(val_dataset,   batch_size=config['batch_size'],
-                              num_workers=8)
+    num_workers = config.get('num_workers', 8)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config['batch_size'],
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=True,   # OPT: avoids worker re-spawn between epochs
+        prefetch_factor=2,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config['batch_size'],
+        num_workers=num_workers,
+        pin_memory=True,           # FIX 3: was missing on val_loader
+        persistent_workers=True,
+        prefetch_factor=2,
+    )
 
-    # ---- model ----------------------------------------------------------
-    vit = vit_b_32(pretrained=False)
+    # FIX 4: pretrained= keyword removed in torchvision ≥ 0.16 → use weights=
+    vit = vit_b_32(weights=None)
     checkpoint = torch.load(config['model_path'], map_location=device)
     vit.load_state_dict(checkpoint)
     vit   = vit.to(device)
     model = ViTEncoder(vit, output_dim=128).to(device)
 
-    # ---- loss -----------------------------------------------------------
+    # OPT: torch.compile gives ~15-25% throughput gain on H100.
+    # Requires PyTorch ≥ 2.0. The first epoch is slower (compilation),
+    # subsequent epochs are faster. Remove if using PyTorch 1.x.
+    try:
+        model = torch.compile(model, mode='reduce-overhead')
+        print("    [torch.compile] enabled")
+    except Exception as e:
+        print(f"    [torch.compile] skipped: {e}")
+
     learnable = (temp_type == 'learnable')
     if loss_type == 'supervised_contrastive':
         criterion = SupervisedContrastiveLoss(temperature=temp_value, learnable=learnable)
@@ -816,11 +783,10 @@ def run_experiment(dataset_paths, dataset_names, loss_type, temp_type, temp_valu
         criterion = SymmetricContrastiveLoss(temperature=temp_value, learnable=learnable)
     criterion = criterion.to(device)
 
-    # ---- optimiser ------------------------------------------------------
     if learnable:
         optimizer = torch.optim.Adam([
-            {'params': model.projection.parameters(),   'lr': config['learning_rate']},
-            {'params': [criterion.log_temperature],     'lr': config['learning_rate'] * 10},
+            {'params': model.projection.parameters(),  'lr': config['learning_rate']},
+            {'params': [criterion.log_temperature],    'lr': config['learning_rate'] * 10},
         ], weight_decay=1e-4)
     else:
         optimizer = torch.optim.Adam(
@@ -829,12 +795,15 @@ def run_experiment(dataset_paths, dataset_names, loss_type, temp_type, temp_valu
         )
 
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config['epochs'])
-    scaler    = torch.cuda.amp.GradScaler()
+
+    # FIX 2: GradScaler with device string (cuda.amp.GradScaler deprecated)
+    scaler = torch.amp.GradScaler('cuda')
 
     loss_history     = []
     val_acc_history  = []
     temp_history     = []
     last_val_metrics = {}
+    val_acc          = 0.0
 
     for epoch in range(config['epochs']):
         loss = train_epoch(model, criterion, optimizer, train_loader,
@@ -847,9 +816,9 @@ def run_experiment(dataset_paths, dataset_names, loss_type, temp_type, temp_valu
         )
 
         if is_val_epoch:
-            # On the very last epoch, also collect embeddings for t-SNE
-            get_embeddings = (epoch == config['epochs'] - 1 and config.get('tsne_enabled', True))
-            val_metrics    = evaluate_model(
+            get_embeddings   = (epoch == config['epochs'] - 1
+                                and config.get('tsne_enabled', True))
+            val_metrics      = evaluate_model(
                 model, val_loader, device, num_classes,
                 return_embeddings=get_embeddings
             )
@@ -869,7 +838,6 @@ def run_experiment(dataset_paths, dataset_names, loss_type, temp_type, temp_valu
                 f"τ={current_temp:.4f}"
             )
         else:
-            # Carry forward last known values so histories stay aligned
             val_acc_history.append(val_acc_history[-1] if val_acc_history else 0.0)
             temp_history.append(temp_history[-1] if temp_history else temp_value)
 
@@ -881,10 +849,8 @@ def run_experiment(dataset_paths, dataset_names, loss_type, temp_type, temp_valu
         'temp_history':    temp_history,
         'val_acc':         val_acc_history[-1],
         'val_metrics':     last_val_metrics,
-        # kept at top level for ResultsManager bootstrap CI
         '_true':           last_val_metrics.get('_true',  np.array([])),
         '_preds':          last_val_metrics.get('_preds', np.array([])),
-        # embeddings present only on last epoch when tsne_enabled=True
         '_embeddings':     last_val_metrics.get('_embeddings', None),
         '_emb_labels':     last_val_metrics.get('_labels',     None),
         'final_temp':      temp_history[-1],
@@ -893,7 +859,7 @@ def run_experiment(dataset_paths, dataset_names, loss_type, temp_type, temp_valu
 
 
 # ============================================================================
-# MAIN
+# MAIN  (single-GPU fallback, not used by launch_parallel.py)
 # ============================================================================
 
 def main():
@@ -901,7 +867,6 @@ def main():
     print(f"Device: {device}\n")
 
     results_mgr = ResultsManager(CONFIG['output_dir'])
-
     temp_settings = (
         [('fixed',     t) for t in FIXED_TEMPS] +
         [('learnable', t) for t in LEARNABLE_TEMPS]
@@ -948,7 +913,6 @@ def main():
                     if not fold_results:
                         continue
 
-                    # ---- save metrics -----------------------------------
                     results_mgr.save_experiment(
                         dataset_combo_name, loss_type, temp_type, temp_value,
                         fold_results, n_bootstrap=CONFIG['bootstrap_n']
@@ -962,21 +926,14 @@ def main():
                         f"F1: {np.mean(f1s):.4f} ± {np.std(f1s):.4f}\n"
                     )
 
-                    # ---- t-SNE (last fold, last epoch embeddings) -------
                     last_fold = fold_results[-1]
                     if (CONFIG.get('tsne_enabled', True)
                             and last_fold.get('_embeddings') is not None):
-
-                        # Build dataset-source list for the full val split
-                        # (we don't store per-sample source in run_experiment,
-                        #  so we approximate: all from the primary dataset key)
                         emb_labels = last_fold['_emb_labels']
                         n_emb      = len(emb_labels)
-                        # Repeat dataset names proportionally across the embedding set
-                        # If single dataset: trivial. If combined: approximate equally.
                         n_datasets = len(dataset_keys)
-                        sources    = []
                         chunk      = n_emb // n_datasets
+                        sources    = []
                         for i, dk in enumerate(dataset_keys):
                             end = n_emb if i == n_datasets - 1 else (i + 1) * chunk
                             sources.extend([dk] * (end - len(sources)))
@@ -994,7 +951,6 @@ def main():
                             title=(f"{dataset_combo_name} | {loss_type} | "
                                    f"{temp_type} τ={temp_value:.2f}"),
                         )
-
     finally:
         results_mgr.close()
         print(f"\nAll results saved to: {results_mgr.get_results_dir()}")
